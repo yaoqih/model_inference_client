@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic
+tritonclient[http]
+docker
+nvidia-ml-py
