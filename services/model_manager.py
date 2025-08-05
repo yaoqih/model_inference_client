@@ -6,13 +6,13 @@ import uuid
 from threading import Lock
 from typing import Dict, List, Optional, Type
 
-from ..models.schemas import (ModelInstanceInfo,
+from models.schemas import (ModelInstanceInfo,
                                                    ModelInstanceStatus,
                                                    ModelType, ModelStatusItem, StartRequest, StopRequest)
-from ..runners.base_runner import BaseRunner
-from ..runners.comfyui_runner import ComfyUIRunner
-from ..runners.triton_runner import TritonRunner
-from ..config import RUNNERS_CONFIG
+from runners.base_runner import BaseRunner
+from runners.comfyui_runner import ComfyUIRunner
+from runners.triton_runner import TritonRunner
+from config import RUNNERS_CONFIG, MODEL_BACKEND_MAPPING
 
 
 class ModelManager:
@@ -52,10 +52,36 @@ class ModelManager:
         }
         print("ModelManager initialized with runners.")
 
+    def _detect_model_backend(self, model_name: str) -> ModelType:
+        """
+        根据模型名称自动检测推理后端类型
+        
+        Args:
+            model_name: 模型名称
+            
+        Returns:
+            ModelType: 推理后端类型
+            
+        Raises:
+            ValueError: 如果模型名称不在支持列表中
+        """
+        if model_name in MODEL_BACKEND_MAPPING:
+            backend_str = MODEL_BACKEND_MAPPING[model_name]
+            return ModelType(backend_str)
+        
+        # 收集所有支持的模型名称用于错误信息
+        all_supported_models = set(MODEL_BACKEND_MAPPING.keys())
+        
+        # 如果都没找到，抛出异常
+        raise ValueError(
+            f"Unsupported model: '{model_name}'. "
+            f"Supported models: {sorted(list(all_supported_models))}"
+        )
+
     def start_model(self, request: StartRequest) -> ModelInstanceInfo:
         """
-        Starts a model on the specified GPUs.
-
+        启动模型，支持自动检测后端类型
+        
         Args:
             request: The StartRequest object from the API.
 
@@ -65,13 +91,23 @@ class ModelManager:
         Raises:
             ValueError: If the requested model_type is not supported.
         """
+        # 如果没有指定model_type，自动检测
+        if request.model_type is None:
+            request.model_type = self._detect_model_backend(request.model_name)
+        
+        # 验证model_type和model_name的组合是否有效
         runner = self.runners.get(request.model_type)
         if not runner:
             raise ValueError(f"Unsupported model type: {request.model_type}")
+        
+        # 验证模型是否在该runner的支持列表中
+        if hasattr(runner, 'config') and 'supported_models' in runner.config:
+            if request.model_name not in runner.config['supported_models']:
+                raise ValueError(f"Model '{request.model_name}' is not supported by {request.model_type} backend")
 
         try:
             model_info = runner.start(**request.dict())
-            print(f"Model '{request.model_name}' started on GPU {request.gpu_id}")
+            print(f"Model '{request.model_name}' started on GPU {request.gpu_id} using {request.model_type} backend")
             return model_info
         except Exception as e:
             print(f"Failed to start model '{request.model_name}': {e}")
@@ -79,14 +115,18 @@ class ModelManager:
 
     def stop_model(self, request: StopRequest) -> Optional[ModelInstanceInfo]:
         """
-        Stops a model on the specified GPU.
-
+        停止模型，支持自动检测后端类型
+        
         Args:
             request: The StopRequest object from the API.
 
         Returns:
             The final status information of the model, or None if not found.
         """
+        # 如果没有指定model_type，自动检测
+        if request.model_type is None:
+            request.model_type = self._detect_model_backend(request.model_name)
+        
         runner = self.runners.get(request.model_type)
         if not runner:
             raise ValueError(f"Unsupported model type: {request.model_type}")
@@ -202,18 +242,35 @@ class ModelManager:
         
         return simplified_items
 
+    def get_supported_models(self) -> Dict[str, str]:
+        """
+        获取支持的模型列表及其对应的后端类型
+        
+        Returns:
+            Dict[str, str]: 模型名称到后端类型的映射
+        """
+        supported_models = {}
+        
+        # 首先从全局映射中获取
+        supported_models.update(MODEL_BACKEND_MAPPING)  
+        
+        return supported_models
+
     def shutdown(self):
         """
-        Stops all running models.
+        Stops all running models and shuts down runners.
         This is intended to be called on application shutdown.
         """
-        print("Shutting down all models...")
+        print("Shutting down all model runners...")
         
         for model_type, runner in self.runners.items():
-            if hasattr(runner, 'shutdown_server_if_needed'):
-                runner.shutdown_server_if_needed()
+            if hasattr(runner, 'shutdown'):
+                try:
+                    runner.shutdown()
+                except Exception as e:
+                    print(f"Error shutting down {model_type} runner: {e}")
 
-        print("All models have been requested to stop.")
+        print("All model runners have been shut down.")
 
 
 # Create a single, globally accessible instance of the manager

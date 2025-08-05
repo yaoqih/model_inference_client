@@ -6,9 +6,18 @@ import os
 # Base directory of the model_inference_client package
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Global model to backend mapping
+# This mapping allows automatic detection of the appropriate backend for each model
+MODEL_BACKEND_MAPPING = {
+    "MAM": "triton",
+    "FastFitAll": "triton",
+    "chane_face": "comfyui",
+}
+
 TRITON_RUNNER_CONFIG = {
+    "use_dedicated_server": True,  # If True, a dedicated Triton server will be launched for each model
     "image_name": "nvcr.io/nvidia/tritonserver:25.04-py3",
-    "container_name": "triton_server",
+    "container_name": "triton_server_auto",
     "model_repository_host_path": '/mnt/sdb_data/triton_inference_server/model_repository',
     "runtime_host_path":'/mnt/sdb_data/triton_inference_server/runtime',
     "http_port": 8000,
@@ -29,7 +38,7 @@ TRITON_RUNNER_CONFIG = {
         "default": {
             "instances_per_gpu": 1,  # Default for models not explicitly configured
         }
-    }
+    },
 }
 
 COMFYUI_RUNNER_CONFIG = {

@@ -6,8 +6,8 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
-from .api.routes import router as api_router
-from .services.model_manager import model_manager
+from api.routes import router as api_router
+from services.model_manager import model_manager
 
 
 @asynccontextmanager
@@ -42,4 +42,4 @@ async def read_root():
 if __name__ == "__main__":
     # This block allows running the app directly for development.
     # For production, it's recommended to use a process manager like Gunicorn.
-    uvicorn.run(app, host="0.0.0.0", port=6004)
+    uvicorn.run("main:app", host="0.0.0.0", port=6004,workers=4)

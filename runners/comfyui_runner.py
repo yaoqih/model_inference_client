@@ -3,7 +3,7 @@ Concrete implementation of the BaseRunner for ComfyUI.
 """
 from typing import Dict, Any
 
-from ..models.schemas import ModelInstanceInfo
+from models.schemas import ModelInstanceInfo
 from .base_runner import BaseRunner
 
 

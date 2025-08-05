@@ -32,7 +32,7 @@ class StartRequest(BaseModel):
     Request schema for starting a model on a specific GPU.
     """
     model_name: str = Field(..., description="The name of the model to start.")
-    model_type: ModelType = Field(..., description="The type of the serving backend.")
+    model_type: Optional[ModelType] = Field(None, description="The type of the serving backend. If not provided, will be auto-detected from model name.")
     gpu_id: int = Field(..., ge=0, description="GPU ID to add instance on.")
     config: Dict[str, Any] = Field({}, description="Backend-specific configuration options.")
 
@@ -42,7 +42,7 @@ class StopRequest(BaseModel):
     Request schema for stopping a model on a specific GPU.
     """
     model_name: str = Field(..., description="The name of the model.")
-    model_type: ModelType = Field(..., description="The type of the serving backend.")
+    model_type: Optional[ModelType] = Field(None, description="The type of the serving backend. If not provided, will be auto-detected from model name.")
     gpu_id: int = Field(..., ge=0, description="GPU ID to remove instance from.")
 
 

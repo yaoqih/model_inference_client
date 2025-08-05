@@ -1,15 +1,15 @@
 """
 API routes for the model inference client.
 """
-from typing import List
+from typing import List, Dict
 
 from fastapi import APIRouter, HTTPException, Body, Query
 from starlette import status
 
-from ..models.schemas import (ModelInstanceInfo, ModelType, ModelStatusItem,
+from models.schemas import (ModelInstanceInfo, ModelType, ModelStatusItem,
                                                    StartRequest, StopRequest, GPUInfo, KillProcessResponse)
-from ..services.model_manager import model_manager
-from ..utils.gpu_utils import get_gpu_info, kill_process_by_pid
+from services.model_manager import model_manager
+from utils.gpu_utils import get_gpu_info, kill_process_by_pid
 
 router = APIRouter()
 
@@ -64,6 +64,7 @@ async def kill_process(pid: int):
 async def start_model_on_gpu(request: StartRequest = Body(...)):
     """
     Starts a model on the specified GPU.
+    The model backend type will be automatically detected from the model name if not specified.
     If the model is already running on other GPUs, the new GPU will be added.
     """
     try:
@@ -87,6 +88,7 @@ async def start_model_on_gpu(request: StartRequest = Body(...)):
 async def stop_model_on_gpu(request: StopRequest = Body(...)):
     """
     Stops a model on the specified GPU.
+    The model backend type will be automatically detected from the model name if not specified.
     If the model is running on other GPUs, those will continue running.
     If this is the last GPU, the model will be completely stopped.
     """
@@ -137,3 +139,17 @@ async def get_model_status(model_name: str):
             detail=f"Model '{model_name}' not found.",
         )
     return model_items
+
+
+@router.get(
+    "/models/supported",
+    response_model=Dict[str, str],
+    summary="Get list of supported models and their backends"
+)
+async def get_supported_models():
+    """
+    Returns a mapping of supported model names to their backend types.
+    This endpoint helps users understand which models are available and
+    which backend will be used for each model.
+    """
+    return model_manager.get_supported_models()
