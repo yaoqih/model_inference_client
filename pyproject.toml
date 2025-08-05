@@ -1,0 +1,25 @@
+[project]
+name = "model-inference-client"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "docker>=7.1.0",
+    "fastapi>=0.116.1",
+    "nvidia-ml-py>=12.575.51",
+    "pydantic>=2.11.7",
+    "tritonclient[http]>=2.59.0",
+    "uvicorn>=0.35.0",
+]
+[[index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+[tool.hatch.build.targets.wheel]
+packages = ["src/model_inference_client"]
+[project.scripts]
+model_inference_client = "model_inference_client.main:run"
