@@ -6,8 +6,8 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
-from .api.routes import router as api_router
-from .services.model_manager import model_manager
+from model_inference_client.api.routes import router as api_router
+from model_inference_client.services.model_manager import model_manager
 
 
 @asynccontextmanager
@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     yield
     # Code to run on shutdown
     print("Model Inference Client API shutting down...")
-    model_manager.shutdown()
+    await model_manager.shutdown()
 
 
 app = FastAPI(

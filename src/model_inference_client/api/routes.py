@@ -6,10 +6,10 @@ from typing import List, Dict
 from fastapi import APIRouter, HTTPException, Body, Query
 from starlette import status
 
-from models.schemas import (ModelInstanceInfo, ModelType, ModelStatusItem,
+from model_inference_client.models.schemas import (ModelInstanceInfo, ModelType, ModelStatusItem,
                                                    StartRequest, StopRequest, GPUInfo, KillProcessResponse)
-from services.model_manager import model_manager
-from utils.gpu_utils import get_gpu_info, kill_process_by_pid
+from model_inference_client.services.model_manager import model_manager
+from model_inference_client.utils.gpu_utils import get_gpu_info, kill_process_by_pid
 
 router = APIRouter()
 
@@ -68,7 +68,7 @@ async def start_model_on_gpu(request: StartRequest = Body(...)):
     If the model is already running on other GPUs, the new GPU will be added.
     """
     try:
-        model_info = model_manager.start_model(request)
+        model_info = await model_manager.start_model(request)
         return model_info
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -93,7 +93,7 @@ async def stop_model_on_gpu(request: StopRequest = Body(...)):
     If this is the last GPU, the model will be completely stopped.
     """
     try:
-        model_info = model_manager.stop_model(request)
+        model_info = await model_manager.stop_model(request)
         if not model_info:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -119,7 +119,7 @@ async def get_all_models_status():
     Retrieves the status of all managed models.
     Returns a list where each item represents a model instance on a specific GPU.
     """
-    return model_manager.get_all_statuses_simplified()
+    return await model_manager.get_all_statuses_simplified()
 
 
 @router.get(
@@ -132,7 +132,7 @@ async def get_model_status(model_name: str):
     Retrieves the status of a single model by its name.
     Returns a list where each item represents a model instance on a specific GPU.
     """
-    model_items = model_manager.get_model_status_by_name_simplified(model_name)
+    model_items = await model_manager.get_model_status_by_name_simplified(model_name)
     if not model_items:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

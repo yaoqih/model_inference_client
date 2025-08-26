@@ -4,7 +4,7 @@ Abstract Base Class for model runners.
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 
-from models.schemas import ModelInstanceInfo
+from model_inference_client.models.schemas import ModelInstanceInfo
 
 
 class BaseRunner(ABC):

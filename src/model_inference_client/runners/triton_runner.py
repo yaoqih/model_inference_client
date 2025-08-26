@@ -3,22 +3,22 @@ Concrete implementation of the BaseRunner for Triton Inference Server.
 This runner manages a single, long-lived Triton Docker container and
 controls the models loaded within it via Triton's API.
 """
+import asyncio
 import time
 import uuid
 import subprocess
 import json
-import requests
+import httpx
 from datetime import datetime
-from threading import Lock
 from typing import Dict, Any, Optional, Set, List
 from pathlib import Path
 
 from tritonclient.http import InferenceServerClient
 
-from models.schemas import ModelInstanceInfo, ModelInstanceStatus
-from .base_runner import BaseRunner
-from utils.config_utils import generate_triton_config, remove_triton_config
-from utils.network_utils import find_free_port
+from model_inference_client.models.schemas import ModelInstanceInfo, ModelInstanceStatus
+from model_inference_client.runners.base_runner import BaseRunner
+from model_inference_client.utils.config_utils import generate_triton_config, remove_triton_config
+from model_inference_client.utils.network_utils import find_free_port
 
 
 class TritonRunner(BaseRunner):
@@ -29,7 +29,7 @@ class TritonRunner(BaseRunner):
 
     def __init__(self, runner_config: Dict[str, Any]):
         super().__init__(runner_config)
-        self._lock = Lock()
+        self._lock = asyncio.Lock()
         self.use_dedicated_server = self.config.get("use_dedicated_server", False)
 
         # State for shared server mode
@@ -49,45 +49,45 @@ class TritonRunner(BaseRunner):
         
         print(f"TritonRunner initialized in {'dedicated' if self.use_dedicated_server else 'shared'} server mode.")
 
-    def _run_command(self, cmd: List[str], capture_output: bool = True) -> subprocess.CompletedProcess:
-        """Execute a shell command and return the result."""
-        try:
-            result = subprocess.run(
-                cmd, 
-                capture_output=capture_output, 
-                text=True, 
-                check=True
-            )
-            return result
-        except subprocess.CalledProcessError as e:
+    async def _run_command(self, cmd: List[str]) -> str:
+        """Execute a shell command asynchronously and return stdout."""
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            error_message = stderr.decode().strip()
             print(f"Command failed: {' '.join(cmd)}")
-            print(f"Error: {e.stderr}")
-            raise e
-
-    def _http_request(self, method: str, endpoint: str, http_port: int, data: Optional[Dict] = None, timeout: int = 180) -> requests.Response:
-        """Make HTTP request to a Triton server with proper error handling."""
-        url = f"http://localhost:{http_port}/{endpoint}"
+            print(f"Error: {error_message}")
+            raise subprocess.CalledProcessError(process.returncode, cmd, output=stdout, stderr=stderr)
         
-        try:
-            response = requests.request(
-                method=method,
-                url=url, 
-                json=data,
-                timeout=timeout,
-                headers={'Content-Type': 'application/json'}
-            )
-            return response
-        except requests.exceptions.Timeout:
-            raise TimeoutError(f"HTTP {method} request to {endpoint} timed out")
-        except requests.exceptions.ConnectionError:
-            raise ConnectionError(f"Failed to connect to Triton server at {url}")
-        except Exception as e:
-            raise RuntimeError(f"HTTP {method} request failed: {e}")
+        return stdout.decode().strip()
 
-    def _load_model_http(self, model_name: str, http_port: int) -> bool:
+    async def _http_request(self, method: str, endpoint: str, http_port: int, data: Optional[Dict] = None, timeout: int = 180) -> httpx.Response:
+        """Make an asynchronous HTTP request to a Triton server."""
+        url = f"http://localhost:{http_port}/{endpoint}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.request(
+                    method=method,
+                    url=url,
+                    json=data,
+                    timeout=timeout,
+                    headers={'Content-Type': 'application/json'}
+                )
+                return response
+            except httpx.TimeoutException:
+                raise TimeoutError(f"HTTP {method} request to {endpoint} timed out")
+            except httpx.RequestError as e:
+                raise ConnectionError(f"Failed to connect to Triton server at {url}: {e}")
+
+    async def _load_model_http(self, model_name: str, http_port: int) -> bool:
         """Load model using HTTP API (non-blocking)."""
         try:
-            response = self._http_request("POST", f"v2/repository/models/{model_name}/load", http_port)
+            response = await self._http_request("POST", f"v2/repository/models/{model_name}/load", http_port)
             if response.status_code == 200:
                 print(f"Successfully initiated loading of model '{model_name}' on port {http_port}")
                 return True
@@ -98,10 +98,10 @@ class TritonRunner(BaseRunner):
             print(f"Error loading model '{model_name}': {e}")
             return False
 
-    def _unload_model_http(self, model_name: str, http_port: int) -> bool:
+    async def _unload_model_http(self, model_name: str, http_port: int) -> bool:
         """Unload model using HTTP API (non-blocking)."""
         try:
-            response = self._http_request("POST", f"v2/repository/models/{model_name}/unload", http_port)
+            response = await self._http_request("POST", f"v2/repository/models/{model_name}/unload", http_port)
             if response.status_code == 200:
                 print(f"Successfully initiated unloading of model '{model_name}' on port {http_port}")
                 return True
@@ -112,35 +112,35 @@ class TritonRunner(BaseRunner):
             print(f"Error unloading model '{model_name}': {e}")
             return False
 
-    def _is_model_ready_http(self, model_name: str, http_port: int) -> bool:
+    async def _is_model_ready_http(self, model_name: str, http_port: int) -> bool:
         """Check if model is ready using HTTP API."""
         try:
-            response = self._http_request("GET", f"v2/models/{model_name}/ready", http_port, timeout=5)
+            response = await self._http_request("GET", f"v2/models/{model_name}/ready", http_port, timeout=5)
             return response.status_code == 200
         except Exception:
             return False
 
-    def _find_existing_container(self):
+    async def _find_existing_container(self):
         """Finds if the shared container is already running on startup."""
         try:
             container_name = self.config["container_name"]
-            result = self._run_command([
+            result = await self._run_command([
                 "docker", "ps", "--filter", f"name={container_name}",
                 "--format", "{{.ID}}\t{{.Status}}"
             ])
-            if result.stdout.strip():
-                container_info = result.stdout.strip().split('\t')
+            if result.strip():
+                container_info = result.strip().split('\t')
                 container_id, status = container_info[0], container_info[1]
                 if "Up" in status:
                     self.shared_container_id = container_id
-                    self._on_server_started(self.config['http_port'])
+                    await self._on_server_started(self.config['http_port'])
                     print(f"Found existing running shared Triton container '{container_name}' (ID: {self.shared_container_id}).")
                 else:
                     print(f"Found shared Triton container '{container_name}' but it's not running (Status: {status}).")
         except (subprocess.CalledProcessError, Exception) as e:
             print(f"Could not check for existing shared container: {e}")
 
-    def _start_server(self, model_name: Optional[str] = None) -> Dict[str, Any]:
+    async def _start_server(self, model_name: Optional[str] = None) -> Dict[str, Any]:
         """Starts a Triton Docker container."""
         if self.use_dedicated_server:
             http_port = find_free_port()
@@ -179,12 +179,11 @@ class TritonRunner(BaseRunner):
             f"--metrics-port={metrics_port}"
         ])
 
-        result = self._run_command(cmd)
-        container_id = result.stdout.strip()
+        container_id = await self._run_command(cmd)
         print(f"Container '{container_name}' started with ID: {container_id}")
 
-        self._wait_for_server_ready(http_port)
-        self._on_server_started(http_port)
+        await self._wait_for_server_ready(http_port)
+        await self._on_server_started(http_port)
 
         server_info = {"container_id": container_id, "http_port": http_port, "grpc_port": grpc_port, "metrics_port": metrics_port}
         if self.use_dedicated_server:
@@ -194,7 +193,7 @@ class TritonRunner(BaseRunner):
         
         return server_info
 
-    def _on_server_started(self, http_port: int):
+    async def _on_server_started(self, http_port: int):
         """Actions to perform once a server container is confirmed running."""
         if self.use_dedicated_server:
             # No shared client in dedicated mode
@@ -203,16 +202,16 @@ class TritonRunner(BaseRunner):
             self.shared_triton_client = InferenceServerClient(url=f"localhost:{http_port}", verbose=False)
             self.shared_server_is_ready = True
             print(f"Shared Triton server on port {http_port} is ready.")
-            self._sync_existing_models()
+            await self._sync_existing_models()
 
-    def _sync_existing_models(self):
+    async def _sync_existing_models(self):
         """Synchronize internal state with models currently loaded in the shared Triton server."""
         if self.use_dedicated_server or not self.shared_server_is_ready:
             return
         
         try:
             http_port = self.config["http_port"]
-            response = self._http_request("POST", "v2/repository/index", http_port, timeout=10)
+            response = await self._http_request("POST", "v2/repository/index", http_port, timeout=10)
             if response.status_code != 200:
                 print(f"Failed to get repository index from shared server: {response.status_code}")
                 return
@@ -223,7 +222,7 @@ class TritonRunner(BaseRunner):
                 model_name = model_info['name']
                 model_state = model_info.get('state', 'UNKNOWN')
                 
-                if model_state == 'READY' and self._is_model_ready_http(model_name, http_port):
+                if model_state == 'READY' and await self._is_model_ready_http(model_name, http_port):
                     print(f"Syncing existing model '{model_name}' state from shared server...")
                     
                     gpu_ids = self._extract_gpu_ids_from_current_config(model_name)
@@ -242,7 +241,7 @@ class TritonRunner(BaseRunner):
                             active_gpu_ids=sorted(gpu_ids),
                             total_instances=len(gpu_ids) * instances_per_gpu,
                             status=ModelInstanceStatus.RUNNING,
-                            pid=self._get_container_pid(),
+                            pid=await self._get_container_pid(self.shared_container_id),
                             port=self.config["http_port"],
                             created_at=current_time,
                             updated_at=current_time,
@@ -302,30 +301,31 @@ class TritonRunner(BaseRunner):
             print(f"Error extracting GPU IDs from config for {model_name}: {e}")
             return []
 
-    def _get_container_pid(self, container_id: str) -> Optional[int]:
+    async def _get_container_pid(self, container_id: str) -> Optional[int]:
         """Get the PID of a container."""
         if not container_id:
             return None
         try:
-            result = self._run_command(["docker", "inspect", container_id, "--format", "{{.State.Pid}}"])
-            return int(result.stdout.strip())
+            result = await self._run_command(["docker", "inspect", container_id, "--format", "{{.State.Pid}}"])
+            return int(result.strip())
         except (subprocess.CalledProcessError, ValueError):
             return None
 
-    def _wait_for_server_ready(self, http_port: int):
+    async def _wait_for_server_ready(self, http_port: int):
         """Waits until a Triton server is live and ready."""
         print(f"Waiting for Triton server on port {http_port} to be ready...")
         timeout = self.config.get("api_timeout_seconds", 120)
         start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"http://localhost:{http_port}/v2/health/live", timeout=5)
-                if response.status_code == 200:
-                    print(f"Triton server on port {http_port} is live.")
-                    return
-            except requests.exceptions.RequestException:
-                pass  # Ignore connection errors while waiting
-            time.sleep(1)
+        async with httpx.AsyncClient() as client:
+            while time.time() - start_time < timeout:
+                try:
+                    response = await client.get(f"http://localhost:{http_port}/v2/health/live", timeout=5)
+                    if response.status_code == 200:
+                        print(f"Triton server on port {http_port} is live.")
+                        return
+                except httpx.RequestError:
+                    pass  # Ignore connection errors while waiting
+                await asyncio.sleep(1)
         raise TimeoutError(f"Triton server on port {http_port} failed to become ready in time.")
 
     def _get_instances_per_gpu(self, model_name: str) -> int:
@@ -335,16 +335,16 @@ class TritonRunner(BaseRunner):
             return model_configs[model_name]["instances_per_gpu"]
         return model_configs.get("default", {}).get("instances_per_gpu", 1)
 
-    def _update_model_config_and_reload(self, model_name: str, http_port: int):
+    async def _update_model_config_and_reload(self, model_name: str, http_port: int):
         """Regenerate config and reload the model in a Triton server."""
         gpu_ids = list(self.model_gpu_mapping.get(model_name, []))
         
         if not gpu_ids:
             # Unload model if no GPUs are assigned
             try:
-                if self._is_model_ready_http(model_name, http_port):
+                if await self._is_model_ready_http(model_name, http_port):
                     print(f"Unloading model '{model_name}' from server on port {http_port}...")
-                    self._unload_model_http(model_name, http_port)
+                    await self._unload_model_http(model_name, http_port)
             except Exception as e:
                 print(f"Error unloading model '{model_name}': {e}")
             remove_triton_config(model_name, self.config["model_repository_host_path"])
@@ -362,31 +362,31 @@ class TritonRunner(BaseRunner):
 
         try:
             print(f"Initiating load/reload of model '{model_name}' on port {http_port}...")
-            success = self._load_model_http(model_name, http_port)
+            success = await self._load_model_http(model_name, http_port)
             if not success:
                 raise RuntimeError(f"Failed to initiate loading of model '{model_name}'")
             print(f"Model '{model_name}' load request sent successfully.")
         except Exception as e:
             raise RuntimeError(f"Failed to reload model '{model_name}': {e}")
 
-    def _update_model_status(self, model_name: str):
+    async def _update_model_status(self, model_name: str):
         """Update model status from STARTING to RUNNING if model is ready."""
         if model_name in self.model_info and self.model_info[model_name].status == ModelInstanceStatus.STARTING:
             http_port = self.model_info[model_name].port
-            if self._is_model_ready_http(model_name, http_port):
+            if await self._is_model_ready_http(model_name, http_port):
                 self.model_info[model_name].status = ModelInstanceStatus.RUNNING
                 self.model_info[model_name].updated_at = datetime.utcnow().isoformat()
 
-    def shutdown(self):
+    async def shutdown(self):
         """Stops all managed Triton containers."""
-        with self._lock:
+        async with self._lock:
             print("Shutting down all Triton containers managed by this runner...")
             
             # Shutdown shared container
             if self.shared_container_id:
                 print(f"Stopping shared container {self.shared_container_id}...")
                 try:
-                    self._run_command(["docker", "stop", self.shared_container_id])
+                    await self._run_command(["docker", "stop", self.shared_container_id])
                     print(f"Shared container {self.shared_container_id} stopped.")
                 except subprocess.CalledProcessError as e:
                     print(f"Error stopping shared container {self.shared_container_id}: {e}")
@@ -398,7 +398,7 @@ class TritonRunner(BaseRunner):
                 container_id = container_info["container_id"]
                 print(f"Stopping dedicated container {container_id} for model '{model_name}'...")
                 try:
-                    self._run_command(["docker", "stop", container_id])
+                    await self._run_command(["docker", "stop", container_id])
                     print(f"Dedicated container {container_id} stopped.")
                 except subprocess.CalledProcessError as e:
                     print(f"Error stopping dedicated container {container_id}: {e}")
@@ -406,20 +406,20 @@ class TritonRunner(BaseRunner):
             self.dedicated_containers.clear()
             print("All Triton containers have been shut down.")
 
-    def start(self, **kwargs) -> ModelInstanceInfo:
+    async def start(self, **kwargs) -> ModelInstanceInfo:
         """Add a GPU to a model's instance group, starting a server if needed."""
         model_name = kwargs["model_name"]
         gpu_id = kwargs["gpu_id"]
 
-        with self._lock:
+        async with self._lock:
             # Determine which server to use or start
             if self.use_dedicated_server:
                 if model_name not in self.dedicated_containers:
-                    server_info = self._start_server(model_name)
+                    server_info = await self._start_server(model_name)
                 else:
                     server_info = self.dedicated_containers[model_name]
             else:
-                server_info = self._start_server()
+                server_info = await self._start_server()
 
             container_id = server_info["container_id"]
             http_port = server_info["http_port"]
@@ -430,7 +430,7 @@ class TritonRunner(BaseRunner):
                 self.model_info[model_name] = ModelInstanceInfo(
                     model_name=model_name, model_type="triton", active_gpu_ids=[],
                     total_instances=0, status=ModelInstanceStatus.STARTING,
-                    pid=self._get_container_pid(container_id), port=http_port,
+                    pid=await self._get_container_pid(container_id), port=http_port,
                     created_at=datetime.utcnow().isoformat(), updated_at=datetime.utcnow().isoformat()
                 )
 
@@ -442,7 +442,7 @@ class TritonRunner(BaseRunner):
             self.model_gpu_mapping[model_name].add(gpu_id)
 
             try:
-                self._update_model_config_and_reload(model_name, http_port)
+                await self._update_model_config_and_reload(model_name, http_port)
                 
                 instances_per_gpu = self._get_instances_per_gpu(model_name)
                 self.model_info[model_name].active_gpu_ids = sorted(list(self.model_gpu_mapping[model_name]))
@@ -459,29 +459,29 @@ class TritonRunner(BaseRunner):
                     del self.model_gpu_mapping[model_name]
                     del self.model_info[model_name]
                     if self.use_dedicated_server and model_name in self.dedicated_containers:
-                        self._stop_dedicated_server(model_name)
+                        await self._stop_dedicated_server(model_name)
                 
                 raise e
 
-    def _stop_dedicated_server(self, model_name: str):
+    async def _stop_dedicated_server(self, model_name: str):
         """Stops and removes a dedicated server container."""
         if model_name in self.dedicated_containers:
             container_id = self.dedicated_containers[model_name]["container_id"]
             print(f"Stopping dedicated container {container_id} for model '{model_name}'...")
             try:
-                self._run_command(["docker", "stop", container_id])
+                await self._run_command(["docker", "stop", container_id])
                 print(f"Dedicated container {container_id} stopped.")
             except subprocess.CalledProcessError as e:
                 print(f"Error stopping dedicated container {container_id}: {e}")
             finally:
                 del self.dedicated_containers[model_name]
 
-    def stop(self, **kwargs) -> Optional[ModelInstanceInfo]:
+    async def stop(self, **kwargs) -> Optional[ModelInstanceInfo]:
         """Remove a GPU from a model's instance group."""
         model_name = kwargs["model_name"]
         gpu_id = kwargs["gpu_id"]
 
-        with self._lock:
+        async with self._lock:
             if model_name not in self.model_gpu_mapping:
                 print(f"Model '{model_name}' is not currently running.")
                 return None
@@ -495,7 +495,7 @@ class TritonRunner(BaseRunner):
             http_port = self.model_info[model_name].port
 
             try:
-                self._update_model_config_and_reload(model_name, http_port)
+                await self._update_model_config_and_reload(model_name, http_port)
                 
                 if not self.model_gpu_mapping[model_name]:
                     # No GPUs left, stop the model and potentially the server
@@ -508,7 +508,7 @@ class TritonRunner(BaseRunner):
                     
                     print(f"Model '{model_name}' completely stopped.")
                     if self.use_dedicated_server:
-                        self._stop_dedicated_server(model_name)
+                        await self._stop_dedicated_server(model_name)
                     
                     return final_info
                 else:
@@ -527,19 +527,19 @@ class TritonRunner(BaseRunner):
                 self.model_gpu_mapping[model_name].add(gpu_id)
                 return None
 
-    def get_all_active_models(self) -> List[ModelInstanceInfo]:
+    async def get_all_active_models(self) -> List[ModelInstanceInfo]:
         """Returns a list of all active model instances managed by this runner."""
-        with self._lock:
+        async with self._lock:
             # Update status of any starting models
             for model_name in list(self.model_info.keys()):
-                self._update_model_status(model_name)
+                await self._update_model_status(model_name)
             return list(self.model_info.values())
 
-    def get_status(self, model_name: str) -> Optional[ModelInstanceInfo]:
+    async def get_status(self, model_name: str) -> Optional[ModelInstanceInfo]:
         """Get the status of a specific model."""
-        with self._lock:
+        async with self._lock:
             if model_name in self.model_info:
-                self._update_model_status(model_name)
+                await self._update_model_status(model_name)
                 return self.model_info[model_name]
             return None
 

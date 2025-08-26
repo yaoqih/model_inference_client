@@ -44,12 +44,14 @@ class StopRequest(BaseModel):
     model_name: str = Field(..., description="The name of the model.")
     model_type: Optional[ModelType] = Field(None, description="The type of the serving backend. If not provided, will be auto-detected from model name.")
     gpu_id: int = Field(..., ge=0, description="GPU ID to remove instance from.")
+    instance_id: Optional[str] = Field(None, description="The specific instance ID to stop, if applicable.")
 
 
 class ModelInstanceInfo(BaseModel):
     """
     Response schema representing a model's status.
     """
+    instance_id: str = Field(default_factory=lambda: str(uuid4()), description="Unique identifier for this model instance.")
     model_name: str = Field(..., description="Name of the model.")
     model_type: ModelType = Field(..., description="Type of the serving backend.")
     active_gpu_ids: List[int] = Field(..., description="List of GPUs currently running this model.")

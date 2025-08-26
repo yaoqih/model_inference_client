@@ -1,18 +1,20 @@
 """
 Core service for managing the lifecycle of model instances.
 """
+import asyncio
 import datetime
 import uuid
 from threading import Lock
 from typing import Dict, List, Optional, Type
 
-from models.schemas import (ModelInstanceInfo,
+from model_inference_client.models.schemas import (ModelInstanceInfo,
                                                    ModelInstanceStatus,
                                                    ModelType, ModelStatusItem, StartRequest, StopRequest)
-from runners.base_runner import BaseRunner
-from runners.comfyui_runner import ComfyUIRunner
-from runners.triton_runner import TritonRunner
-from config import RUNNERS_CONFIG, MODEL_BACKEND_MAPPING
+from model_inference_client.runners.base_runner import BaseRunner
+from model_inference_client.runners.comfyui_runner import ComfyUIRunner
+from model_inference_client.runners.triton_runner import TritonRunner
+from model_inference_client.config import RUNNERS_CONFIG, MODEL_BACKEND_MAPPING
+from model_inference_client.utils.gpu_utils import get_gpu_count
 
 
 class ModelManager:
@@ -42,6 +44,12 @@ class ModelManager:
                 if not hasattr(self, 'initialized'):
                     self.config = config or {}
                     self._init_runners(RUNNERS_CONFIG)
+                    
+                    # Initialize GPU locks
+                    num_gpus = get_gpu_count()
+                    self._gpu_locks = {i: asyncio.Lock() for i in range(num_gpus)}
+                    self._active_gpu_models: Dict[int, Optional[str]] = {i: None for i in range(num_gpus)}
+                    
                     self.initialized = True
 
     def _init_runners(self, runner_configs: Dict):
@@ -78,7 +86,7 @@ class ModelManager:
             f"Supported models: {sorted(list(all_supported_models))}"
         )
 
-    def start_model(self, request: StartRequest) -> ModelInstanceInfo:
+    async def start_model(self, request: StartRequest) -> ModelInstanceInfo:
         """
         启动模型，支持自动检测后端类型
         
@@ -89,31 +97,46 @@ class ModelManager:
             Information about the model after starting.
         
         Raises:
-            ValueError: If the requested model_type is not supported.
+            ValueError: If the requested model_type is not supported or GPU is busy.
         """
+        gpu_id = request.gpu_id
+        if gpu_id not in self._gpu_locks:
+            raise ValueError(f"Invalid GPU ID: {gpu_id}")
+
+        # 检查GPU是否已被占用
+        if self._active_gpu_models.get(gpu_id) is not None:
+            raise ValueError(f"GPU {gpu_id} is already in use by model '{self._active_gpu_models[gpu_id]}'.")
+
         # 如果没有指定model_type，自动检测
         if request.model_type is None:
             request.model_type = self._detect_model_backend(request.model_name)
         
-        # 验证model_type和model_name的组合是否有效
         runner = self.runners.get(request.model_type)
         if not runner:
             raise ValueError(f"Unsupported model type: {request.model_type}")
         
-        # 验证模型是否在该runner的支持列表中
         if hasattr(runner, 'config') and 'supported_models' in runner.config:
             if request.model_name not in runner.config['supported_models']:
                 raise ValueError(f"Model '{request.model_name}' is not supported by {request.model_type} backend")
 
+        gpu_lock = self._gpu_locks[gpu_id]
+        await gpu_lock.acquire()
         try:
-            model_info = runner.start(**request.dict())
-            print(f"Model '{request.model_name}' started on GPU {request.gpu_id} using {request.model_type} backend")
+            # 标记GPU被占用
+            self._active_gpu_models[gpu_id] = request.model_name
+            
+            model_info = await runner.start(**request.dict())
+            
+            print(f"Model '{request.model_name}' started on GPU {gpu_id} using {request.model_type} backend")
             return model_info
         except Exception as e:
+            # 如果启动失败，释放GPU占用
+            self._active_gpu_models[gpu_id] = None
+            gpu_lock.release()
             print(f"Failed to start model '{request.model_name}': {e}")
             raise e
 
-    def stop_model(self, request: StopRequest) -> Optional[ModelInstanceInfo]:
+    async def stop_model(self, request: StopRequest) -> Optional[ModelInstanceInfo]:
         """
         停止模型，支持自动检测后端类型
         
@@ -123,6 +146,10 @@ class ModelManager:
         Returns:
             The final status information of the model, or None if not found.
         """
+        gpu_id = request.gpu_id
+        if gpu_id not in self._gpu_locks:
+            raise ValueError(f"Invalid GPU ID: {gpu_id}")
+
         # 如果没有指定model_type，自动检测
         if request.model_type is None:
             request.model_type = self._detect_model_backend(request.model_name)
@@ -132,15 +159,23 @@ class ModelManager:
             raise ValueError(f"Unsupported model type: {request.model_type}")
 
         try:
-            model_info = runner.stop(**request.dict())
+            model_info = await runner.stop(**request.dict())
+            
+            # 释放GPU占用
+            self._active_gpu_models[gpu_id] = None
+            if self._gpu_locks[gpu_id].locked():
+                self._gpu_locks[gpu_id].release()
+                
             if model_info:
-                print(f"Model '{request.model_name}' stopped on GPU {request.gpu_id}")
+                print(f"Model '{request.model_name}' stopped on GPU {gpu_id}")
             return model_info
         except Exception as e:
             print(f"Failed to stop model '{request.model_name}': {e}")
+            # Even if stop fails, we should probably check if we need to release the lock.
+            # For now, we assume the runner handles its state.
             raise e
 
-    def get_model_status(self, model_name: str, model_type: ModelType) -> Optional[ModelInstanceInfo]:
+    async def get_model_status(self, model_name: str, model_type: ModelType) -> Optional[ModelInstanceInfo]:
         """
         Gets the status of a specific model.
 
@@ -155,9 +190,9 @@ class ModelManager:
         if not runner:
             return None
         
-        return runner.get_status(model_name)
+        return await runner.get_status(model_name)
 
-    def get_model_status_by_name(self, model_name: str) -> Optional[ModelInstanceInfo]:
+    async def get_model_status_by_name(self, model_name: str) -> Optional[ModelInstanceInfo]:
         """
         Gets the status of a specific model by searching all runners.
 
@@ -169,13 +204,13 @@ class ModelManager:
         """
         for model_type, runner in self.runners.items():
             if hasattr(runner, 'get_status'):
-                model_info = runner.get_status(model_name)
+                model_info = await runner.get_status(model_name)
                 if model_info:
                     return model_info
         
         return None
 
-    def get_all_statuses(self) -> List[ModelInstanceInfo]:
+    async def get_all_statuses(self) -> List[ModelInstanceInfo]:
         """
         Gets the status of all managed models.
 
@@ -186,11 +221,11 @@ class ModelManager:
         
         for model_type, runner in self.runners.items():
             if hasattr(runner, 'get_all_active_models'):
-                all_models.extend(runner.get_all_active_models())
+                all_models.extend(await runner.get_all_active_models())
             
         return all_models
 
-    def get_all_statuses_simplified(self) -> List[ModelStatusItem]:
+    async def get_all_statuses_simplified(self) -> List[ModelStatusItem]:
         """
         Gets the simplified status of all managed models.
         Returns one item per GPU instance.
@@ -202,7 +237,7 @@ class ModelManager:
         
         for model_type, runner in self.runners.items():
             if hasattr(runner, 'get_all_active_models'):
-                models = runner.get_all_active_models()
+                models = await runner.get_all_active_models()
                 for model in models:
                     # Create one item for each GPU the model is running on
                     for gpu_id in model.active_gpu_ids:
@@ -214,7 +249,7 @@ class ModelManager:
         
         return simplified_items
 
-    def get_model_status_by_name_simplified(self, model_name: str) -> List[ModelStatusItem]:
+    async def get_model_status_by_name_simplified(self, model_name: str) -> List[ModelStatusItem]:
         """
         Gets the simplified status of a specific model by searching all runners.
         Returns one item per GPU instance.
@@ -229,7 +264,7 @@ class ModelManager:
         
         for model_type, runner in self.runners.items():
             if hasattr(runner, 'get_status'):
-                model_info = runner.get_status(model_name)
+                model_info = await runner.get_status(model_name)
                 if model_info:
                     # Create one item for each GPU the model is running on
                     for gpu_id in model_info.active_gpu_ids:
@@ -256,19 +291,19 @@ class ModelManager:
         
         return supported_models
 
-    def shutdown(self):
+    async def shutdown(self):
         """
         Stops all running models and shuts down runners.
         This is intended to be called on application shutdown.
         """
         print("Shutting down all model runners...")
         
+        shutdown_tasks = []
         for model_type, runner in self.runners.items():
             if hasattr(runner, 'shutdown'):
-                try:
-                    runner.shutdown()
-                except Exception as e:
-                    print(f"Error shutting down {model_type} runner: {e}")
+                shutdown_tasks.append(runner.shutdown())
+        
+        await asyncio.gather(*shutdown_tasks, return_exceptions=True)
 
         print("All model runners have been shut down.")
 

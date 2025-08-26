@@ -11,6 +11,7 @@ dependencies = [
     "pydantic>=2.11.7",
     "tritonclient[http]>=2.59.0",
     "uvicorn>=0.35.0",
+    "httpx>=0.27.0",
 ]
 [[index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"

@@ -7,6 +7,21 @@ try:
 except ImportError:
     pynvml = None
 
+def get_gpu_count() -> int:
+    """Returns the number of available GPUs."""
+    if pynvml is None:
+        # In an environment without GPUs or nvidia-ml-py, assume 0.
+        # This allows the server to run for CPU-only tasks or management.
+        return 0
+    try:
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        pynvml.nvmlShutdown()
+        return device_count
+    except pynvml.NVMLError:
+        # If NVML fails to initialize (e.g., no NVIDIA driver), return 0.
+        return 0
+
 def get_gpu_info() -> List[Dict[str, Any]]:
     if pynvml is None:
         raise ImportError("pynvml is not installed. Please install it with 'pip install nvidia-ml-py'")
